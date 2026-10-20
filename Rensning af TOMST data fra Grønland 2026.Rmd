@@ -1,0 +1,285 @@
+---
+title: "Rensning af TOMST data fra Grønland 2026"
+author: "J.D, Salling"
+date: "2026-10-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Introduktion
+
+Dette script bruges til at importere, samle og rense TOMST-data indsamlet i Grønland i sommeren 2026. Dataene kontrolleres for manglende værdier, ekstreme temperaturer, gentagne tidsstempler, uregelmæssige måleintervaller og pludselige temperaturændringer. På baggrund af kontrollen håndteres tre temperaturmålinger, der vurderes at være påvirket af sensorhåndtering. Formålet er at sikre et overskueligt og pålideligt datasæt til efterfølgende analyse.
+
+#1. Importér og saml data
+```{r}
+library(dplyr)
+
+sti <- "C:/Users/johan/OneDrive/Desktop/Aau/7. semester/P7/DATA/TOMST data"
+
+filer <- list.files(
+  sti,
+  pattern = "\\.csv$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+tomst_data <- lapply(filer, function(fil) {
+  data <- read.csv2(fil, header = FALSE)
+
+  names(data) <- c(
+    "maaling", "tidspunkt", "temp1", "temp2", "temp3",
+    "maalevaerdi", "status1", "status2"
+  )
+
+  data$fil <- basename(fil)
+  data$lokation <- basename(dirname(dirname(fil)))
+  data$habitat <- basename(dirname(fil))
+
+  data
+}) |>
+  bind_rows() |>
+  mutate(
+    across(c(temp1, temp2, temp3, maalevaerdi), as.numeric),
+    tidspunkt = as.POSIXct(
+      tidspunkt,
+      format = "%Y.%m.%d %H:%M",
+      tz = "UTC"
+    )
+  ) |>
+  filter(tidspunkt >= as.POSIXct("2026-07-12 00:00", tz = "UTC"))
+```
+
+# 2. Overblik over data
+
+```{r}
+print(summary(tomst_data[c("temp1", "temp2", "temp3", "maalevaerdi")]))
+
+print(
+  tomst_data |>
+    group_by(fil) |>
+    summarise(
+      foerste_maaling = min(tidspunkt),
+      sidste_maaling = max(tidspunkt),
+      antal_maalinger = n(),
+      .groups = "drop"
+    ),
+  n = Inf
+)
+
+```
+
+# 3. Kontrol af manglende værdier og ekstreme temperaturer
+```{r}
+kontrol <- tomst_data |>
+  group_by(fil) |>
+  summarise(
+    antal_maalinger = n(),
+    manglende_temp1 = sum(is.na(temp1)),
+    manglende_temp2 = sum(is.na(temp2)),
+    manglende_temp3 = sum(is.na(temp3)),
+    manglende_fugt = sum(is.na(maalevaerdi)),
+    temp_under_minus50 = sum(
+      temp1 < -50 | temp2 < -50 | temp3 < -50,
+      na.rm = TRUE
+    ),
+    temp_over_50 = sum(
+      temp1 > 50 | temp2 > 50 | temp3 > 50,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+print(kontrol, n = Inf)
+```
+
+# Vis eventuelle ekstreme temperaturer
+
+```{r}
+tomst_data |>
+  filter(
+    if_any(c(temp1, temp2, temp3), ~ .x < -50 | .x > 50)
+  ) |>
+  select(tidspunkt, fil, temp1, temp2, temp3) |>
+  print(n = Inf)
+```
+
+# 4. Kontrol af tidsstempler og måleintervaller
+## Gentagne tidsstempler
+```{r}
+gentagne_tider <- tomst_data |>
+  count(fil, tidspunkt) |>
+  filter(n > 1)
+
+print(gentagne_tider, n = Inf)
+```
+
+## Afvigelser fra det forventede interval på 15 minutter
+```{r}
+tidsintervaller <- tomst_data |>
+  arrange(fil, tidspunkt) |>
+  group_by(fil) |>
+  mutate(
+    interval_min = as.numeric(
+      difftime(tidspunkt, lag(tidspunkt), units = "mins")
+    )
+  ) |>
+  filter(!is.na(interval_min), interval_min != 15) |>
+  select(fil, tidspunkt, interval_min) |>
+  ungroup()
+
+print(tidsintervaller, n = Inf)
+```
+
+## Undersøg et bestemt tidsrum omkring de konstaterede målehuller
+```{r}
+tomst_data |>
+  filter(
+    fil %in% c(
+      "LS3-1.csv",
+      "TMS 96647821.csv",
+      "TMS 96647823 gios 18.csv"
+    ),
+    tidspunkt >= as.POSIXct("2026-07-17 22:00", tz = "UTC"),
+    tidspunkt <= as.POSIXct("2026-07-18 05:00", tz = "UTC")
+  ) |>
+  arrange(fil, tidspunkt) |>
+  select(fil, tidspunkt, temp1, temp2, temp3, maalevaerdi)
+
+```
+
+## 5. Kontrol af store temperaturændringer
+```{r}
+temperaturspring <- tomst_data |>
+  arrange(fil, tidspunkt) |>
+  group_by(fil) |>
+  mutate(
+    interval_min = as.numeric(
+      difftime(tidspunkt, lag(tidspunkt), units = "mins")
+    ),
+    across(
+      c(temp1, temp2, temp3),
+      ~ abs(.x - lag(.x)),
+      .names = "{.col}_aendring"
+    )
+  ) |>
+  filter(
+    if_any(ends_with("_aendring"), ~ .x > 5)
+  ) |>
+  select(
+    fil, tidspunkt, interval_min, temp1, temp2, temp3,
+    temp1_aendring, temp2_aendring, temp3_aendring
+  ) |>
+  ungroup()
+
+print(temperaturspring, n = Inf, width = Inf)
+```
+
+# 6. Find mulige isolerede temperaturspring
+
+```{r}
+spike_kontrol <- tomst_data |>
+  arrange(fil, tidspunkt) |>
+  group_by(fil) |>
+  mutate(
+    interval_forrige = as.numeric(
+      difftime(tidspunkt, lag(tidspunkt), units = "mins")
+    ),
+    interval_naeste = as.numeric(
+      difftime(lead(tidspunkt), tidspunkt, units = "mins")
+    ),
+    across(
+      c(temp1, temp2, temp3),
+      list(forrige = lag, naeste = lead),
+      .names = "{.col}_{.fn}"
+    )
+  ) |>
+  filter(interval_forrige == 15, interval_naeste == 15) |>
+  filter(
+    if_any(
+      c(temp1, temp2, temp3),
+      ~ abs(.x - lag(.x)) > 5
+    )
+  )
+```
+
+## Kontrol af isolerede spring med stabile nabomålinger
+```{r}
+spike_kontrol <- tomst_data |>
+  arrange(fil, tidspunkt) |>
+  group_by(fil) |>
+  mutate(
+    interval_forrige = as.numeric(
+      difftime(tidspunkt, lag(tidspunkt), units = "mins")
+    ),
+    interval_naeste = as.numeric(
+      difftime(lead(tidspunkt), tidspunkt, units = "mins")
+    ),
+    across(
+      c(temp1, temp2, temp3),
+      list(forrige = lag, naeste = lead),
+      .names = "{.col}_{.fn}"
+    )
+  ) |>
+  filter(interval_forrige == 15, interval_naeste == 15) |>
+  filter(
+    (abs(temp1 - temp1_forrige) > 5 &
+       abs(temp1 - temp1_naeste) > 5 &
+       abs(temp1_forrige - temp1_naeste) < 2) |
+    (abs(temp2 - temp2_forrige) > 5 &
+       abs(temp2 - temp2_naeste) > 5 &
+       abs(temp2_forrige - temp2_naeste) < 2) |
+    (abs(temp3 - temp3_forrige) > 5 &
+       abs(temp3 - temp3_naeste) > 5 &
+       abs(temp3_forrige - temp3_naeste) < 2)
+  ) |>
+  select(
+    fil, tidspunkt,
+    temp1_forrige, temp1, temp1_naeste,
+    temp2_forrige, temp2, temp2_naeste,
+    temp3_forrige, temp3, temp3_naeste
+  ) |>
+  ungroup()
+
+print(spike_kontrol, n = Inf, width = Inf)
+```
+
+# 7. Fjern de tre målinger påvirket af sensorhåndtering
+De tre sjove målinger ved den nederste sensor korrellere med dage hvor vi var ude og tage målinger i felten og tjekke om loggerne virkede så det er målinger der har fanget at vi har taget loggerne op for at tjekke om de virkede. Derfor eksluderes de fra datasættet.
+```{r}
+tomst_data <- tomst_data |>
+  mutate(
+    temp1 = if_else(
+      (fil == "LF3-5.csv" &
+         tidspunkt == as.POSIXct("2026-07-15 16:30:00", tz = "UTC")) |
+      (fil == "LS3-6.csv" &
+         tidspunkt == as.POSIXct("2026-07-15 16:45:00", tz = "UTC")) |
+      (fil == "TMS 94193522.csv" &
+         tidspunkt == as.POSIXct("2026-07-18 14:15:00", tz = "UTC")),
+      NA_real_,
+      temp1
+    )
+  )
+```
+## Kontrollér, at de tre værdier er sat til NA
+
+```{r}
+tomst_data |>
+  filter(
+    (fil == "LF3-5.csv" &
+       tidspunkt == as.POSIXct("2026-07-15 16:30:00", tz = "UTC")) |
+    (fil == "LS3-6.csv" &
+       tidspunkt == as.POSIXct("2026-07-15 16:45:00", tz = "UTC")) |
+    (fil == "TMS 94193522.csv" &
+       tidspunkt == as.POSIXct("2026-07-18 14:15:00", tz = "UTC"))
+  ) |>
+  nrow()
+
+tomst_data |>
+  filter(is.na(temp1)) |>
+  select(fil, tidspunkt, temp1, temp2, temp3)
+```
+
+
